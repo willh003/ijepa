@@ -23,6 +23,7 @@ def make_transforms(
     horizontal_flip=False,
     color_distortion=False,
     gaussian_blur=False,
+    to_tensor=True,
     normalization=((0.485, 0.456, 0.406),
                    (0.229, 0.224, 0.225))
 ):
@@ -46,7 +47,8 @@ def make_transforms(
         transform_list += [get_color_distortion(s=color_jitter)]
     if gaussian_blur:
         transform_list += [GaussianBlur(p=0.5)]
-    transform_list += [transforms.ToTensor()]
+    if to_tensor:
+        transform_list += [transforms.ToTensor()]
     transform_list += [transforms.Normalize(normalization[0], normalization[1])]
 
     transform = transforms.Compose(transform_list)

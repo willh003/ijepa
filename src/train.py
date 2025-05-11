@@ -6,21 +6,27 @@
 #
 
 import os
+import wandb  # Add wandb import
+
+def set_os_vars() -> None:
+
+    os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+    # Get egl (mujoco) rendering to work on cluster
+    os.environ["NVIDIA_VISIBLE_DEVICES"] = "all"
+    os.environ["NVIDIA_DRIVER_CAPABILITIES"] = "compute,graphics,utility,video"
+    os.environ["MUJOCO_GL"] = "egl"
+    os.environ["PYOPENGL_PLATFORM"] = "egl"
+    os.environ["EGL_PLATFORM"] = "device"
+    # Get wandb file (e.g. rendered) gif more accessible
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
-try:
-    # -- WARNING: IF DOING DISTRIBUTED TRAINING ON A NON-SLURM CLUSTER, MAKE
-    # --          SURE TO UPDATE THIS TO GET LOCAL-RANK ON NODE, OR ENSURE
-    # --          THAT YOUR JOBS ARE LAUNCHED WITH ONLY 1 DEVICE VISIBLE
-    # --          TO EACH PROCESS
-    os.environ['CUDA_VISIBLE_DEVICES'] = os.environ['SLURM_LOCALID']
-except Exception:
-    pass
+set_os_vars()
 
 import copy
 import logging
 import sys
 import yaml
+import pprint
 
 import numpy as np
 
@@ -29,25 +35,25 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
-from src.masks.multiblock import MaskCollator as MBMaskCollator
-from src.masks.utils import apply_masks
-from src.utils.distributed import (
+from ijepa.src.masks.multiblock import MaskCollator as MBMaskCollator
+from ijepa.src.masks.utils import apply_masks
+from ijepa.src.utils.distributed import (
     init_distributed,
     AllReduce
 )
-from src.utils.logging import (
+from ijepa.src.utils.logging import (
     CSVLogger,
     gpu_timer,
     grad_logger,
     AverageMeter)
-from src.utils.tensors import repeat_interleave_batch
-from src.datasets.imagenet1k import make_imagenet1k
+from ijepa.src.utils.tensors import repeat_interleave_batch
+from ijepa.src.datasets.ijepa_earthnet import make_earthnet_ijepa
 
-from src.helper import (
+from ijepa.src.helper import (
     load_checkpoint,
     init_model,
     init_opt)
-from src.transforms import make_transforms
+from ijepa.src.transforms import make_transforms
 
 # --
 log_timings = True
@@ -65,6 +71,16 @@ logger = logging.getLogger()
 
 
 def main(args, resume_preempt=False):
+    # Initialize wandb
+    wandb.init(
+        project="earth",
+        entity="pcgc",
+        name="ijepa",
+        config=args,
+        dir="train_logs",
+        tags=["ijepa"],
+        mode="online" if args["enable_wandb"] else "disabled"
+    )
 
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
@@ -75,7 +91,7 @@ def main(args, resume_preempt=False):
     model_name = args['meta']['model_name']
     load_model = args['meta']['load_checkpoint'] or resume_preempt
     r_file = args['meta']['read_checkpoint']
-    copy_data = args['meta']['copy_data']
+    copy_data = False #args['meta']['copy_data']
     pred_depth = args['meta']['pred_depth']
     pred_emb_dim = args['meta']['pred_emb_dim']
     if not torch.cuda.is_available():
@@ -136,18 +152,22 @@ def main(args, resume_preempt=False):
         pass
 
     # -- init torch distributed backend
-    world_size, rank = init_distributed()
+
+    # TODO: remove this (forces a single GPU)
+    rank_and_world_size = (0, 1)
+    world_size, rank = init_distributed(port=29500, rank_and_world_size=rank_and_world_size)
+
     logger.info(f'Initialized (rank/world-size) {rank}/{world_size}')
     if rank > 0:
         logger.setLevel(logging.ERROR)
 
     # -- log/checkpointing paths
     log_file = os.path.join(folder, f'{tag}_r{rank}.csv')
-    save_path = os.path.join(folder, f'{tag}' + '-ep{epoch}.pth.tar')
+    save_path = os.path.join(folder, f'{tag}' + 'checkpoint.pth.tar')
     latest_path = os.path.join(folder, f'{tag}-latest.pth.tar')
     load_path = None
     if load_model:
-        load_path = os.path.join(folder, r_file) if r_file is not None else latest_path
+        load_path = r_file
 
     # -- make csv_logger
     csv_logger = CSVLogger(log_file,
@@ -186,24 +206,22 @@ def main(args, resume_preempt=False):
         gaussian_blur=use_gaussian_blur,
         horizontal_flip=use_horizontal_flip,
         color_distortion=use_color_distortion,
+        to_tensor=False,
         color_jitter=color_jitter)
 
     # -- init data-loaders/samplers
-    _, unsupervised_loader, unsupervised_sampler = make_imagenet1k(
+    _, unsupervised_loader, unsupervised_sampler = make_earthnet_ijepa(
             transform=transform,
             batch_size=batch_size,
             collator=mask_collator,
             pin_mem=pin_mem,
-            training=True,
             num_workers=num_workers,
             world_size=world_size,
             rank=rank,
             root_path=root_path,
-            image_folder=image_folder,
-            copy_data=copy_data,
             drop_last=True)
     ipe = len(unsupervised_loader)
-
+    
     # -- init optimizer and scheduler
     optimizer, scaler, scheduler, wd_scheduler = init_opt(
         encoder=encoder,
@@ -261,7 +279,7 @@ def main(args, resume_preempt=False):
         if rank == 0:
             torch.save(save_dict, latest_path)
             if (epoch + 1) % checkpoint_freq == 0:
-                torch.save(save_dict, save_path.format(epoch=f'{epoch + 1}'))
+                torch.save(save_dict, save_path)
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -279,13 +297,14 @@ def main(args, resume_preempt=False):
 
             def load_imgs():
                 # -- unsupervised imgs
-                imgs = udata[0].to(device, non_blocking=True)
+                imgs = udata.to(device, non_blocking=True)
                 masks_1 = [u.to(device, non_blocking=True) for u in masks_enc]
                 masks_2 = [u.to(device, non_blocking=True) for u in masks_pred]
                 return (imgs, masks_1, masks_2)
             imgs, masks_enc, masks_pred = load_imgs()
             maskA_meter.update(len(masks_enc[0][0]))
             maskB_meter.update(len(masks_pred[0][0]))
+
 
             def train_step():
                 _new_lr = scheduler.step()
@@ -313,10 +332,11 @@ def main(args, resume_preempt=False):
                     return loss
 
                 # Step 1. Forward
-                with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=use_bfloat16):
-                    h = forward_target()
-                    z = forward_context()
-                    loss = loss_fn(z, h)
+                
+               
+                h = forward_target()
+                z = forward_context()
+                loss = loss_fn(z, h)
 
                 #  Step 2. Backward & step
                 if use_bfloat16:
@@ -365,6 +385,17 @@ def main(args, resume_preempt=False):
                                        grad_stats.last_layer,
                                        grad_stats.min,
                                        grad_stats.max))
+                    
+                    # Log to wandb
+                    wandb.log({
+                        "train/loss": loss_meter.avg,
+                        "train/maskA": maskA_meter.avg,
+                        "train/maskB": maskB_meter.avg,
+                        "train/lr": _new_lr,
+                        "train/wd": _new_wd,
+                        "epoch": epoch + 1,
+                        "iteration": itr
+                    })
 
             log_stats()
 
@@ -373,7 +404,23 @@ def main(args, resume_preempt=False):
         # -- Save Checkpoint after every epoch
         logger.info('avg. loss %.3f' % loss_meter.avg)
         save_checkpoint(epoch+1)
+        
+        # Log epoch metrics to wandb
+        wandb.log({
+            "epoch/loss": loss_meter.avg,
+            "epoch": epoch + 1
+        })
+
+    # Close wandb
+    wandb.finish()
 
 
 if __name__ == "__main__":
-    main()
+    params = None
+    fname = "/home/wph52/causal-earth/ijepa/configs/earthnet_vitl14.yaml"
+    with open(fname, 'r') as y_file:
+        params = yaml.load(y_file, Loader=yaml.FullLoader)
+        logger.info('loaded params...')
+        pp = pprint.PrettyPrinter(indent=4)
+        pp.pprint(params)
+    main(params)
