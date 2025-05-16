@@ -15,7 +15,7 @@ data:
   use_horizontal_flip: false
 logging:
   folder: /home/wph52/causal-earth/ijepa/logs
-  write_tag: jepa_scratch
+  write_tag: jepa_pretrained
 mask:
   allow_overlap: false
   aspect_ratio:
@@ -33,7 +33,7 @@ mask:
   - 0.2
 meta:
   copy_data: false
-  load_checkpoint: false
+  load_checkpoint: true
   model_name: vit_large
   pred_depth: 12
   pred_emb_dim: 384
